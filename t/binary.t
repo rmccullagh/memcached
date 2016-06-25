@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 3639;
+use Test::More tests => 3723;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
@@ -61,7 +61,6 @@ my $mc = MC::Client->new;
 # Let's turn on detail stats for all this stuff
 
 $mc->stats('detail on');
-
 my $check = sub {
     my ($key, $orig_flags, $orig_val) = @_;
     my ($flags, $val, $cas) = $mc->get($key);

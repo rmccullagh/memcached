@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 
 use strict;
-use Test::More tests => 97;
+use Test::More tests => 103;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
@@ -30,6 +30,7 @@ my $sock = $server->sock;
 ## STAT cmd_touch 0
 ## STAT get_hits 0
 ## STAT get_misses 0
+## STAT get_expired 0
 ## STAT delete_misses 0
 ## STAT delete_hits 0
 ## STAT incr_misses 0
@@ -48,6 +49,7 @@ my $sock = $server->sock;
 ## STAT limit_maxbytes 67108864
 ## STAT accepting_conns 1
 ## STAT listen_disabled_num 0
+## STAT time_in_listen_disabled_us 0
 ## STAT threads 4
 ## STAT conn_yields 0
 ## STAT hash_power_level 16
@@ -70,12 +72,12 @@ my $sock = $server->sock;
 my $stats = mem_stats($sock);
 
 # Test number of keys
-is(scalar(keys(%$stats)), 52, "52 stats values");
+is(scalar(keys(%$stats)), 58, "58 stats values");
 
 # Test initial state
-foreach my $key (qw(curr_items total_items bytes cmd_get cmd_set get_hits evictions get_misses
+foreach my $key (qw(curr_items total_items bytes cmd_get cmd_set get_hits evictions get_misses get_expired
                  bytes_written delete_hits delete_misses incr_hits incr_misses decr_hits
-                 decr_misses listen_disabled_num lrutail_reflocked)) {
+                 decr_misses listen_disabled_num lrutail_reflocked time_in_listen_disabled_us)) {
     is($stats->{$key}, 0, "initial $key is zero");
 }
 is($stats->{accepting_conns}, 1, "initial accepting_conns is one");
@@ -189,6 +191,7 @@ is(0, $stats->{'cmd_get'});
 is(0, $stats->{'cmd_set'});
 is(0, $stats->{'get_hits'});
 is(0, $stats->{'get_misses'});
+is(0, $stats->{'get_expired'});
 is(0, $stats->{'delete_misses'});
 is(0, $stats->{'delete_hits'});
 is(0, $stats->{'incr_misses'});
@@ -201,6 +204,14 @@ is(0, $stats->{'cas_badval'});
 is(0, $stats->{'evictions'});
 is(0, $stats->{'reclaimed'});
 is(0, $stats->{'lrutail_reflocked'});
+
+# item expired
+print $sock "set should_expire 0 2678400 6\r\nfooval\r\n"; #2678400 = 31 days in seconds
+is(scalar <$sock>, "STORED\r\n", "set item to expire");
+print $sock "get should_expire\r\n";
+is(scalar <$sock>, "END\r\n", "item not returned");
+my $stats = mem_stats($sock);
+is(1, $stats->{'get_expired'}, "get_expired counter is 1");
 
 print $sock "flush_all\r\n";
 is(scalar <$sock>, "OK\r\n", "flushed");

@@ -2,13 +2,13 @@
 #include "memcached.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/signal.h>
 #include <sys/resource.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <signal.h>
 #include <string.h>
 #include <time.h>
 #include <assert.h>
@@ -46,7 +46,7 @@ typedef struct {
 } itemstats_t;
 
 typedef struct {
-    uint64_t histo[60];
+    uint64_t histo[61];
     uint64_t ttl_hourplus;
     uint64_t noexp;
     uint64_t reclaimed;
@@ -61,6 +61,9 @@ static item *tails[LARGEST_ID];
 static crawler crawlers[LARGEST_ID];
 static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
+static unsigned int *stats_sizes_hist = NULL;
+static uint64_t stats_sizes_cas_min = 0;
+static int stats_sizes_buckets = 0;
 static crawlerstats_t crawlerstats[MAX_NUMBER_OF_SLAB_CLASSES];
 
 static int crawler_count = 0;
@@ -74,6 +77,7 @@ static pthread_cond_t  lru_crawler_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t lru_crawler_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t stats_sizes_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void item_stats_reset(void) {
     int i;
@@ -98,7 +102,7 @@ uint64_t get_cas_id(void) {
     return next_id;
 }
 
-static int is_flushed(item *it) {
+int item_is_flushed(item *it) {
     rel_time_t oldest_live = settings.oldest_live;
     uint64_t cas = ITEM_get_cas(it);
     uint64_t oldest_cas = settings.oldest_cas;
@@ -113,6 +117,7 @@ static int is_flushed(item *it) {
 
 static unsigned int noexp_lru_size(int slabs_clsid) {
     int id = CLEAR_LRU(slabs_clsid);
+    id |= NOEXP_LRU;
     unsigned int ret;
     pthread_mutex_lock(&lru_locks[id]);
     ret = sizes[id];
@@ -143,14 +148,14 @@ static unsigned int noexp_lru_size(int slabs_clsid) {
  *
  * Returns the total size of the header.
  */
-static size_t item_make_header(const uint8_t nkey, const int flags, const int nbytes,
+static size_t item_make_header(const uint8_t nkey, const unsigned int flags, const int nbytes,
                      char *suffix, uint8_t *nsuffix) {
     /* suffix is defined at 40 chars elsewhere.. */
-    *nsuffix = (uint8_t) snprintf(suffix, 40, " %d %d\r\n", flags, nbytes - 2);
+    *nsuffix = (uint8_t) snprintf(suffix, 40, " %u %d\r\n", flags, nbytes - 2);
     return sizeof(item) + nkey + *nsuffix + nbytes;
 }
 
-item *do_item_alloc(char *key, const size_t nkey, const int flags,
+item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
                     const rel_time_t exptime, const int nbytes,
                     const uint32_t cur_hv) {
     int i;
@@ -178,7 +183,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
         if (!settings.lru_maintainer_thread) {
             lru_pull_tail(id, COLD_LRU, 0, false, cur_hv);
         }
-        it = slabs_alloc(ntotal, id, &total_chunks);
+        it = slabs_alloc(ntotal, id, &total_chunks, 0);
         if (settings.expirezero_does_not_evict)
             total_chunks -= noexp_lru_size(id);
         if (it == NULL) {
@@ -337,6 +342,7 @@ int do_item_link(item *it, const uint32_t hv) {
     assoc_insert(it, hv);
     item_link_q(it);
     refcount_incr(&it->refcount);
+    item_stats_sizes_add(it);
 
     return 1;
 }
@@ -349,6 +355,7 @@ void do_item_unlink(item *it, const uint32_t hv) {
         stats.curr_bytes -= ITEM_ntotal(it);
         stats.curr_items -= 1;
         STATS_UNLOCK();
+        item_stats_sizes_remove(it);
         assoc_delete(ITEM_key(it), it->nkey, hv);
         item_unlink_q(it);
         do_item_remove(it);
@@ -364,6 +371,7 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
         stats.curr_bytes -= ITEM_ntotal(it);
         stats.curr_items -= 1;
         STATS_UNLOCK();
+        item_stats_sizes_remove(it);
         assoc_delete(ITEM_key(it), it->nkey, hv);
         do_item_unlink_q(it);
         do_item_remove(it);
@@ -461,6 +469,7 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
         key_temp[it->nkey] = 0x00; /* terminate */
         len = snprintf(temp, sizeof(temp), "ITEM %s [%d b; %lu s]\r\n",
                        key_temp, it->nbytes - 2,
+                       it->exptime == 0 ? 0 :
                        (unsigned long)it->exptime + process_started);
         if (bufcurr + len + 6 > memlimit)  /* 6 is END\r\n\0 */
             break;
@@ -476,20 +485,6 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     *bytes = bufcurr;
     pthread_mutex_unlock(&lru_locks[id]);
     return buffer;
-}
-
-void item_stats_evictions(uint64_t *evicted) {
-    int n;
-    for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
-        int i;
-        int x;
-        for (x = 0; x < 4; x++) {
-            i = n | lru_type_map[x];
-            pthread_mutex_lock(&lru_locks[i]);
-            evicted[n] += itemstats[i].evicted;
-            pthread_mutex_unlock(&lru_locks[i]);
-        }
-    }
 }
 
 void item_stats_totals(ADD_STAT add_stats, void *c) {
@@ -586,8 +581,9 @@ void item_stats(ADD_STAT add_stats, void *c) {
             APPEND_NUM_FMT_STAT(fmt, n, "number_hot", "%u", lru_size_map[0]);
             APPEND_NUM_FMT_STAT(fmt, n, "number_warm", "%u", lru_size_map[1]);
             APPEND_NUM_FMT_STAT(fmt, n, "number_cold", "%u", lru_size_map[2]);
-            if (settings.expirezero_does_not_evict)
+            if (settings.expirezero_does_not_evict) {
                 APPEND_NUM_FMT_STAT(fmt, n, "number_noexp", "%u", lru_size_map[3]);
+            }
         }
         APPEND_NUM_FMT_STAT(fmt, n, "age", "%u", age);
         APPEND_NUM_FMT_STAT(fmt, n, "evicted",
@@ -628,6 +624,73 @@ void item_stats(ADD_STAT add_stats, void *c) {
     add_stats(NULL, 0, NULL, 0, c);
 }
 
+bool item_stats_sizes_status(void) {
+    bool ret = false;
+    mutex_lock(&stats_sizes_lock);
+    if (stats_sizes_hist != NULL)
+        ret = true;
+    mutex_unlock(&stats_sizes_lock);
+    return ret;
+}
+
+void item_stats_sizes_init(void) {
+    if (stats_sizes_hist != NULL)
+        return;
+    stats_sizes_buckets = settings.item_size_max / 32 + 1;
+    stats_sizes_hist = calloc(stats_sizes_buckets, sizeof(int));
+    stats_sizes_cas_min = (settings.use_cas) ? get_cas_id() : 0;
+}
+
+void item_stats_sizes_enable(ADD_STAT add_stats, void *c) {
+    mutex_lock(&stats_sizes_lock);
+    if (!settings.use_cas) {
+        APPEND_STAT("sizes_status", "error", "");
+        APPEND_STAT("sizes_error", "cas_support_disabled", "");
+    } else if (stats_sizes_hist == NULL) {
+        item_stats_sizes_init();
+        if (stats_sizes_hist != NULL) {
+            APPEND_STAT("sizes_status", "enabled", "");
+        } else {
+            APPEND_STAT("sizes_status", "error", "");
+            APPEND_STAT("sizes_error", "no_memory", "");
+        }
+    } else {
+        APPEND_STAT("sizes_status", "enabled", "");
+    }
+    mutex_unlock(&stats_sizes_lock);
+}
+
+void item_stats_sizes_disable(ADD_STAT add_stats, void *c) {
+    mutex_lock(&stats_sizes_lock);
+    if (stats_sizes_hist != NULL) {
+        free(stats_sizes_hist);
+        stats_sizes_hist = NULL;
+    }
+    APPEND_STAT("sizes_status", "disabled", "");
+    mutex_unlock(&stats_sizes_lock);
+}
+
+void item_stats_sizes_add(item *it) {
+    if (stats_sizes_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
+        return;
+    int ntotal = ITEM_ntotal(it);
+    int bucket = ntotal / 32;
+    if ((ntotal % 32) != 0) bucket++;
+    if (bucket < stats_sizes_buckets) stats_sizes_hist[bucket]++;
+}
+
+/* I think there's no way for this to be accurate without using the CAS value.
+ * Since items getting their time value bumped will pass this validation.
+ */
+void item_stats_sizes_remove(item *it) {
+    if (stats_sizes_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
+        return;
+    int ntotal = ITEM_ntotal(it);
+    int bucket = ntotal / 32;
+    if ((ntotal % 32) != 0) bucket++;
+    if (bucket < stats_sizes_buckets) stats_sizes_hist[bucket]--;
+}
+
 /** dumps out a list of objects of each size, with granularity of 32 bytes */
 /*@null@*/
 /* Locks are correct based on a technicality. Holds LRU lock while doing the
@@ -635,43 +698,27 @@ void item_stats(ADD_STAT add_stats, void *c) {
  * which don't change.
  */
 void item_stats_sizes(ADD_STAT add_stats, void *c) {
+    mutex_lock(&stats_sizes_lock);
 
-    /* max 1MB object, divided into 32 bytes size buckets */
-    const int num_buckets = 32768;
-    unsigned int *histogram = calloc(num_buckets, sizeof(int));
-
-    if (histogram != NULL) {
+    if (stats_sizes_hist != NULL) {
         int i;
-
-        /* build the histogram */
-        for (i = 0; i < LARGEST_ID; i++) {
-            pthread_mutex_lock(&lru_locks[i]);
-            item *iter = heads[i];
-            while (iter) {
-                int ntotal = ITEM_ntotal(iter);
-                int bucket = ntotal / 32;
-                if ((ntotal % 32) != 0) bucket++;
-                if (bucket < num_buckets) histogram[bucket]++;
-                iter = iter->next;
-            }
-            pthread_mutex_unlock(&lru_locks[i]);
-        }
-
-        /* write the buffer */
-        for (i = 0; i < num_buckets; i++) {
-            if (histogram[i] != 0) {
+        for (i = 0; i < stats_sizes_buckets; i++) {
+            if (stats_sizes_hist[i] != 0) {
                 char key[8];
                 snprintf(key, sizeof(key), "%d", i * 32);
-                APPEND_STAT(key, "%u", histogram[i]);
+                APPEND_STAT(key, "%u", stats_sizes_hist[i]);
             }
         }
-        free(histogram);
+    } else {
+        APPEND_STAT("sizes_status", "disabled", "");
     }
+
     add_stats(NULL, 0, NULL, 0, c);
+    mutex_unlock(&stats_sizes_lock);
 }
 
 /** wrapper around assoc_find which does the lazy expiration logic */
-item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
+item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c) {
     item *it = assoc_find(key, nkey, hv);
     if (it != NULL) {
         refcount_incr(&it->refcount);
@@ -704,7 +751,6 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
             fprintf(stderr, "> NOT FOUND ");
         } else {
             fprintf(stderr, "> FOUND KEY ");
-            was_found++;
         }
         for (ii = 0; ii < nkey; ++ii) {
             fprintf(stderr, "%c", key[ii]);
@@ -712,20 +758,26 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     }
 
     if (it != NULL) {
-        if (is_flushed(it)) {
+        was_found = 1;
+        if (item_is_flushed(it)) {
             do_item_unlink(it, hv);
             do_item_remove(it);
             it = NULL;
-            if (was_found) {
+            if (settings.verbose > 2) {
                 fprintf(stderr, " -nuked by flush");
             }
+            was_found = 2;
         } else if (it->exptime != 0 && it->exptime <= current_time) {
             do_item_unlink(it, hv);
             do_item_remove(it);
             it = NULL;
-            if (was_found) {
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.get_expired++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
+            if (settings.verbose > 2) {
                 fprintf(stderr, " -nuked by expire");
             }
+            was_found = 3;
         } else {
             it->it_flags |= ITEM_FETCHED|ITEM_ACTIVE;
             DEBUG_REFCNT(it, '+');
@@ -734,13 +786,15 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
 
     if (settings.verbose > 2)
         fprintf(stderr, "\n");
+    /* For now this is in addition to the above verbose logging. */
+    LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key, nkey);
 
     return it;
 }
 
 item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
-                    const uint32_t hv) {
-    item *it = do_item_get(key, nkey, hv);
+                    const uint32_t hv, conn *c) {
+    item *it = do_item_get(key, nkey, hv, c);
     if (it != NULL) {
         it->exptime = exptime;
     }
@@ -803,7 +857,7 @@ static int lru_pull_tail(const int orig_id, const int cur_lru,
 
         /* Expired or flushed */
         if ((search->exptime != 0 && search->exptime < current_time)
-            || is_flushed(search)) {
+            || item_is_flushed(search)) {
             itemstats[id].reclaimed++;
             if ((search->it_flags & ITEM_FETCHED) == 0) {
                 itemstats[id].expired_unfetched++;
@@ -860,8 +914,12 @@ static int lru_pull_tail(const int orig_id, const int cur_lru,
                     if ((search->it_flags & ITEM_FETCHED) == 0) {
                         itemstats[id].evicted_unfetched++;
                     }
+                    LOGGER_LOG(NULL, LOG_EVICTIONS, LOGGER_EVICTION, search);
                     do_item_unlink_nolock(search, hv);
                     removed++;
+                    if (settings.slab_automove == 2) {
+                        slabs_reassign(-1, orig_id);
+                    }
                 } else if ((search->it_flags & ITEM_ACTIVE) != 0
                         && settings.lru_maintainer_thread) {
                     itemstats[id].moves_to_warm++;
@@ -904,10 +962,21 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     int did_moves = 0;
     bool mem_limit_reached = false;
     unsigned int total_chunks = 0;
+    unsigned int chunks_perslab = 0;
+    unsigned int chunks_free = 0;
     /* TODO: if free_chunks below high watermark, increase aggressiveness */
-    slabs_available_chunks(slabs_clsid, &mem_limit_reached, &total_chunks);
+    chunks_free = slabs_available_chunks(slabs_clsid, &mem_limit_reached,
+            &total_chunks, &chunks_perslab);
     if (settings.expirezero_does_not_evict)
         total_chunks -= noexp_lru_size(slabs_clsid);
+
+    /* If slab automove is enabled on any level, and we have more than 2 pages
+     * worth of chunks free in this class, ask (gently) to reassign a page
+     * from this class back into the global pool (0)
+     */
+    if (settings.slab_automove > 0 && chunks_free > (chunks_perslab * 2.5)) {
+        slabs_reassign(slabs_clsid, SLAB_GLOBAL_PAGE_POOL);
+    }
 
     /* Juggle HOT/WARM up to N times */
     for (i = 0; i < 1000; i++) {
@@ -1138,7 +1207,6 @@ static item *crawler_crawl_q(item *it) {
     item **head, **tail;
     assert(it->it_flags == 1);
     assert(it->nbytes == 0);
-    assert(it->slabs_clsid < LARGEST_ID);
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
 
@@ -1197,7 +1265,7 @@ static void item_crawler_evaluate(item *search, uint32_t hv, int i) {
     crawlerstats_t *s = &crawlerstats[slab_id];
     itemstats[i].crawler_items_checked++;
     if ((search->exptime != 0 && search->exptime < current_time)
-        || is_flushed(search)) {
+        || item_is_flushed(search)) {
         itemstats[i].crawler_reclaimed++;
         s->reclaimed++;
 
@@ -1237,6 +1305,8 @@ static void *item_crawler_thread(void *arg) {
     int crawls_persleep = settings.crawls_persleep;
 
     pthread_mutex_lock(&lru_crawler_lock);
+    pthread_cond_signal(&lru_crawler_cond);
+    settings.lru_crawler = true;
     if (settings.verbose > 2)
         fprintf(stderr, "Starting LRU crawler background thread\n");
     while (do_run_lru_crawler_thread) {
@@ -1329,6 +1399,17 @@ int stop_item_crawler_thread(void) {
     return 0;
 }
 
+/* Lock dance to "block" until thread is waiting on its condition:
+ * caller locks mtx. caller spawns thread.
+ * thread blocks on mutex.
+ * caller waits on condition, releases lock.
+ * thread gets lock, sends signal.
+ * caller can't wait, as thread has lock.
+ * thread waits on condition, releases lock
+ * caller wakes on condition, gets lock.
+ * caller immediately releases lock.
+ * thread is now safely waiting on condition before the caller returns.
+ */
 int start_item_crawler_thread(void) {
     int ret;
 
@@ -1336,7 +1417,6 @@ int start_item_crawler_thread(void) {
         return -1;
     pthread_mutex_lock(&lru_crawler_lock);
     do_run_lru_crawler_thread = 1;
-    settings.lru_crawler = true;
     if ((ret = pthread_create(&item_crawler_tid, NULL,
         item_crawler_thread, NULL)) != 0) {
         fprintf(stderr, "Can't create LRU crawler thread: %s\n",
@@ -1344,6 +1424,8 @@ int start_item_crawler_thread(void) {
         pthread_mutex_unlock(&lru_crawler_lock);
         return -1;
     }
+    /* Avoid returning until the crawler has actually started */
+    pthread_cond_wait(&lru_crawler_cond, &lru_crawler_lock);
     pthread_mutex_unlock(&lru_crawler_lock);
 
     return 0;

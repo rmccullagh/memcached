@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <string.h>
 #include <pthread.h>
 
@@ -301,13 +300,12 @@ static void cqi_free(CQ_ITEM *item) {
  * Creates a worker thread.
  */
 static void create_worker(void *(*func)(void *), void *arg) {
-    pthread_t       thread;
     pthread_attr_t  attr;
     int             ret;
 
     pthread_attr_init(&attr);
 
-    if ((ret = pthread_create(&thread, &attr, func, arg)) != 0) {
+    if ((ret = pthread_create(&((LIBEVENT_THREAD*)arg)->thread_id, &attr, func, arg)) != 0) {
         fprintf(stderr, "Can't create thread: %s\n",
                 strerror(ret));
         exit(1);
@@ -373,6 +371,10 @@ static void *worker_libevent(void *arg) {
     /* Any per-thread setup can happen here; memcached_thread_init() will block until
      * all threads have finished initializing.
      */
+    me->l = logger_create();
+    if (me->l == NULL) {
+        abort();
+    }
 
     register_thread_initialized();
 
@@ -389,38 +391,51 @@ static void thread_libevent_process(int fd, short which, void *arg) {
     LIBEVENT_THREAD *me = arg;
     CQ_ITEM *item;
     char buf[1];
+    unsigned int timeout_fd;
 
-    if (read(fd, buf, 1) != 1)
+    if (read(fd, buf, 1) != 1) {
         if (settings.verbose > 0)
             fprintf(stderr, "Can't read from libevent pipe\n");
+        return;
+    }
 
     switch (buf[0]) {
     case 'c':
-    item = cq_pop(me->new_conn_queue);
+        item = cq_pop(me->new_conn_queue);
 
-    if (NULL != item) {
-        conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
-                           item->read_buffer_size, item->transport, me->base);
-        if (c == NULL) {
-            if (IS_UDP(item->transport)) {
-                fprintf(stderr, "Can't listen for events on UDP socket\n");
-                exit(1);
-            } else {
-                if (settings.verbose > 0) {
-                    fprintf(stderr, "Can't listen for events on fd %d\n",
-                        item->sfd);
+        if (NULL != item) {
+            conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
+                               item->read_buffer_size, item->transport,
+                               me->base);
+            if (c == NULL) {
+                if (IS_UDP(item->transport)) {
+                    fprintf(stderr, "Can't listen for events on UDP socket\n");
+                    exit(1);
+                } else {
+                    if (settings.verbose > 0) {
+                        fprintf(stderr, "Can't listen for events on fd %d\n",
+                            item->sfd);
+                    }
+                    close(item->sfd);
                 }
-                close(item->sfd);
+            } else {
+                c->thread = me;
             }
-        } else {
-            c->thread = me;
+            cqi_free(item);
         }
-        cqi_free(item);
-    }
         break;
     /* we were told to pause and report in */
     case 'p':
-    register_thread_initialized();
+        register_thread_initialized();
+        break;
+    /* a client socket timed out */
+    case 't':
+        if (read(fd, &timeout_fd, sizeof(timeout_fd)) != sizeof(timeout_fd)) {
+            if (settings.verbose > 0)
+                fprintf(stderr, "Can't read timeout fd from libevent pipe\n");
+            return;
+        }
+        conn_close_idle(conns[timeout_fd]);
         break;
     }
 }
@@ -466,6 +481,48 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
 }
 
 /*
+ * Re-dispatches a connection back to the original thread. Can be called from
+ * any side thread borrowing a connection.
+ * TODO: Look into this. too complicated?
+ */
+#ifdef BOGUS_DEFINE
+void redispatch_conn(conn *c) {
+    CQ_ITEM *item = cqi_new();
+    char buf[1];
+    if (item == NULL) {
+        /* Can't cleanly redispatch connection. close it forcefully. */
+        /* FIXME: is conn_cleanup() necessary?
+         * if conn was handed off to a side thread it should be clean.
+         * could also put it into a "clean_me" state?
+         */
+        c->state = conn_closed;
+        close(c->sfd);
+        return;
+    }
+    LIBEVENT_THREAD *thread = c->thread;
+    item->sfd = sfd;
+    /* pass in the state somehow?
+    item->init_state = conn_closing; */
+    item->event_flags = c->event_flags;
+    item->conn = c;
+}
+#endif
+
+/* This misses the allow_new_conns flag :( */
+void sidethread_conn_close(conn *c) {
+    c->state = conn_closed;
+    if (settings.verbose > 1)
+        fprintf(stderr, "<%d connection closed from side thread.\n", c->sfd);
+    close(c->sfd);
+
+    STATS_LOCK();
+    stats.curr_conns--;
+    STATS_UNLOCK();
+
+    return;
+}
+
+/*
  * Returns true if this is the thread that listens for new TCP connections.
  */
 int is_listen_thread() {
@@ -488,22 +545,22 @@ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbyt
  * Returns an item if it hasn't been marked as expired,
  * lazy-expiring as needed.
  */
-item *item_get(const char *key, const size_t nkey) {
+item *item_get(const char *key, const size_t nkey, conn *c) {
     item *it;
     uint32_t hv;
     hv = hash(key, nkey);
     item_lock(hv);
-    it = do_item_get(key, nkey, hv);
+    it = do_item_get(key, nkey, hv, c);
     item_unlock(hv);
     return it;
 }
 
-item *item_touch(const char *key, size_t nkey, uint32_t exptime) {
+item *item_touch(const char *key, size_t nkey, uint32_t exptime, conn *c) {
     item *it;
     uint32_t hv;
     hv = hash(key, nkey);
     item_lock(hv);
-    it = do_item_touch(key, nkey, exptime, hv);
+    it = do_item_touch(key, nkey, exptime, hv, c);
     item_unlock(hv);
     return it;
 }
@@ -615,6 +672,7 @@ void threadlocal_stats_reset(void) {
 
         threads[ii].stats.get_cmds = 0;
         threads[ii].stats.get_misses = 0;
+        threads[ii].stats.get_expired = 0;
         threads[ii].stats.touch_cmds = 0;
         threads[ii].stats.touch_misses = 0;
         threads[ii].stats.delete_misses = 0;
@@ -627,6 +685,7 @@ void threadlocal_stats_reset(void) {
         threads[ii].stats.conn_yields = 0;
         threads[ii].stats.auth_cmds = 0;
         threads[ii].stats.auth_errors = 0;
+        threads[ii].stats.idle_kicks = 0;
 
         for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
             threads[ii].stats.slab_stats[sid].set_cmds = 0;
@@ -655,6 +714,7 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
 
         stats->get_cmds += threads[ii].stats.get_cmds;
         stats->get_misses += threads[ii].stats.get_misses;
+        stats->get_expired += threads[ii].stats.get_expired;
         stats->touch_cmds += threads[ii].stats.touch_cmds;
         stats->touch_misses += threads[ii].stats.touch_misses;
         stats->delete_misses += threads[ii].stats.delete_misses;
@@ -667,6 +727,7 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
         stats->conn_yields += threads[ii].stats.conn_yields;
         stats->auth_cmds += threads[ii].stats.auth_cmds;
         stats->auth_errors += threads[ii].stats.auth_errors;
+        stats->idle_kicks += threads[ii].stats.idle_kicks;
 
         for (sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
             stats->slab_stats[sid].set_cmds +=
