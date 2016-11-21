@@ -30,7 +30,7 @@ pthread_mutex_t logger_stack_lock = PTHREAD_MUTEX_INITIALIZER;
 
 pthread_key_t logger_key;
 
-#if !defined(HAVE_GCC_ATOMICS) && !defined(__sun)
+#if !defined(HAVE_GCC_64ATOMICS) && !defined(__sun)
 pthread_mutex_t logger_atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
@@ -38,9 +38,6 @@ pthread_mutex_t logger_atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
 logger_watcher *watchers[20];
 struct pollfd watchers_pollfds[20];
 int watcher_count = 0;
-
-static char *logger_uriencode_map[256];
-static char logger_uriencode_str[768];
 
 /* Should this go somewhere else? */
 static const entry_details default_entries[] = {
@@ -57,43 +54,11 @@ static int logger_thread_poll_watchers(int force_poll, int watcher);
  * Util functions shared between bg thread and workers
  *************************/
 
-static void logger_uriencode_init(void) {
-    int x;
-    char *str = logger_uriencode_str;
-    for (x = 0; x < 256; x++) {
-        if (isalnum(x) || x == '-' || x == '.' || x == '_' || x == '~') {
-            logger_uriencode_map[x] = NULL;
-        } else {
-            snprintf(str, 4, "%%%02X", x);
-            logger_uriencode_map[x] = str;
-            str += 3; /* lobbing off the \0 is fine */
-        }
-    }
-}
-
-static bool logger_uriencode(const char *src, char *dst, const size_t srclen, const size_t dstlen) {
-    int x;
-    size_t d = 0;
-    for (x = 0; x < srclen; x++) {
-        if (d + 4 >= dstlen)
-            return false;
-        if (logger_uriencode_map[(unsigned char) src[x]] != NULL) {
-            memcpy(&dst[d], logger_uriencode_map[(unsigned char) src[x]], 3);
-            d += 3;
-        } else {
-            dst[d] = src[x];
-            d++;
-        }
-    }
-    dst[d] = '\0';
-    return true;
-}
-
 /* Logger GID's can be used by watchers to put logs back into strict order
  */
 static uint64_t logger_get_gid(void) {
     static uint64_t logger_gid = 0;
-#ifdef HAVE_GCC_ATOMICS
+#ifdef HAVE_GCC_64ATOMICS
     return __sync_add_and_fetch(&logger_gid, 1);
 #elif defined(__sun)
     return atomic_inc_64_nv(&logger_gid);
@@ -172,18 +137,62 @@ static void logger_set_flags(void) {
  * writes to any watchers.
  *************************/
 
-/* Completes rendering of log line, copies to subscribed watchers */
-/* FIXME: This can be shortened considerably with a refactor for both the
- * "skipped" writing and string conversion.
- */
 #define LOGGER_PARSE_SCRATCH 4096
-static enum logger_parse_entry_ret logger_thread_parse_entry(logentry *e, struct logger_stats *ls) {
+
+static int _logger_thread_parse_ise(logentry *e, char *scratch) {
+    int total;
+    const char *cmd = "na";
+    char keybuf[KEY_MAX_LENGTH * 3 + 1];
+    struct logentry_item_store *le = (struct logentry_item_store *) e->data;
+    const char * const status_map[] = {
+        "stored", "exists", "not_found", "too_large", "no_memory" };
+    const char * const cmd_map[] = {
+        "add", "set", "replace", "append", "prepend", "cas" };
+
+    if (le->cmd <= 5)
+        cmd = cmd_map[le->cmd];
+
+    uriencode(le->key, keybuf, le->nkey, LOGGER_PARSE_SCRATCH);
+    total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
+            "ts=%d.%d gid=%llu type=item_store key=%s status=%s cmd=%s\n",
+            (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
+            keybuf, status_map[le->status], cmd);
+    return total;
+}
+
+static int _logger_thread_parse_ige(logentry *e, char *scratch) {
+    int total;
+    struct logentry_item_get *le = (struct logentry_item_get *) e->data;
+    char keybuf[KEY_MAX_LENGTH * 3 + 1];
+    const char * const was_found_map[] = {
+        "not_found", "found", "flushed", "expired" };
+
+    uriencode(le->key, keybuf, le->nkey, LOGGER_PARSE_SCRATCH);
+    total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
+            "ts=%d.%d gid=%llu type=item_get key=%s status=%s\n",
+            (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
+            keybuf, was_found_map[le->was_found]);
+    return total;
+}
+
+static int _logger_thread_parse_ee(logentry *e, char *scratch) {
+    int total;
+    char keybuf[KEY_MAX_LENGTH * 3 + 1];
+    struct logentry_eviction *le = (struct logentry_eviction *) e->data;
+    uriencode(le->key, keybuf, le->nkey, LOGGER_PARSE_SCRATCH);
+    total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
+            "ts=%d.%d gid=%llu type=eviction key=%s fetch=%s ttl=%lld la=%d\n",
+            (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
+            keybuf, (le->it_flags & ITEM_FETCHED) ? "yes" : "no",
+            (long long int)le->exptime, le->latime);
+
+    return total;
+}
+
+/* Completes rendering of log line. */
+static enum logger_parse_entry_ret logger_thread_parse_entry(logentry *e, struct logger_stats *ls,
+        char *scratch, int *scratch_len) {
     int total = 0;
-    int line_size = 0;
-    int x;
-    char scratch[LOGGER_PARSE_SCRATCH];
-    char scratch2[LOGGER_PARSE_SCRATCH];
-    char *status = "unknown";
 
     switch (e->event) {
         case LOGGER_TEXT_ENTRY:
@@ -191,82 +200,14 @@ static enum logger_parse_entry_ret logger_thread_parse_entry(logentry *e, struct
                         (int)e->tv.tv_sec, (int)e->tv.tv_usec,
                         (unsigned long long) e->gid, (char *) e->data);
             break;
-        case LOGGER_EVICTION_ENTRY: ;
-            struct logentry_eviction *le = (struct logentry_eviction *) e->data;
-            logger_uriencode(le->key, scratch2, le->nkey, LOGGER_PARSE_SCRATCH);
-            total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
-                    "ts=%d.%d gid=%llu type=eviction key=%s fetch=%s ttl=%lld la=%d\n",
-                    (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
-                    scratch2, (le->it_flags & ITEM_FETCHED) ? "yes" : "no",
-                    (long long int)le->exptime, le->latime);
+        case LOGGER_EVICTION_ENTRY:
+            total = _logger_thread_parse_ee(e, scratch);
             break;
-        case LOGGER_ITEM_GET_ENTRY: ;
-            struct logentry_item_get *lig = (struct logentry_item_get *) e->data;
-            switch (lig->was_found) {
-                case 0:
-                    status = "not_found";
-                    break;
-                case 1:
-                    status = "found";
-                    break;
-                case 2:
-                    status = "flushed";
-                    break;
-                case 3:
-                    status = "expired";
-                    break;
-            }
-            logger_uriencode(lig->key, scratch2, lig->nkey, LOGGER_PARSE_SCRATCH);
-            total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
-                    "ts=%d.%d gid=%llu type=item_get key=%s status=%s\n",
-                    (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
-                    scratch2, status);
+        case LOGGER_ITEM_GET_ENTRY:
+            total = _logger_thread_parse_ige(e, scratch);
             break;
-        case LOGGER_ITEM_STORE_ENTRY: ;
-            struct logentry_item_store *lis = (struct logentry_item_store *) e->data;
-            char *cmd = "na";
-            switch (lis->status) {
-                case STORED:
-                    status = "stored";
-                    break;
-                case EXISTS:
-                    status = "exists";
-                    break;
-                case NOT_FOUND:
-                    status = "not_found";
-                    break;
-                case TOO_LARGE:
-                    status = "too_large";
-                    break;
-                case NO_MEMORY:
-                    status = "no_memory";
-                    break;
-            }
-            switch (lis->cmd) {
-                case NREAD_ADD:
-                    cmd = "add";
-                    break;
-                case NREAD_SET:
-                    cmd = "set";
-                    break;
-                case NREAD_REPLACE:
-                    cmd = "replace";
-                    break;
-                case NREAD_APPEND:
-                    cmd = "append";
-                    break;
-                case NREAD_PREPEND:
-                    cmd = "prepend";
-                    break;
-                case NREAD_CAS:
-                    cmd = "cas";
-                    break;
-            }
-            logger_uriencode(lis->key, scratch2, lis->nkey, LOGGER_PARSE_SCRATCH);
-            total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
-                    "ts=%d.%d gid=%llu type=item_store key=%s status=%s cmd=%s\n",
-                    (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
-                    scratch2, status, cmd);
+        case LOGGER_ITEM_STORE_ENTRY:
+            total = _logger_thread_parse_ise(e, scratch);
             break;
 
     }
@@ -275,65 +216,56 @@ static enum logger_parse_entry_ret logger_thread_parse_entry(logentry *e, struct
         L_DEBUG("LOGGER: Failed to flatten log entry!\n");
         return LOGGER_PARSE_ENTRY_FAILED;
     } else {
-        line_size = total + 1;
+        *scratch_len = total + 1;
     }
 
-    /* Write the line into available watcher with the right flags */
+    return LOGGER_PARSE_ENTRY_OK;
+}
+
+/* Writes flattened entry to available watchers */
+static void logger_thread_write_entry(logentry *e, struct logger_stats *ls,
+        char *scratch, int scratch_len) {
+    int x, total;
+    /* Write the line into available watchers with matching flags */
     for (x = 0; x < WATCHER_LIMIT; x++) {
         logger_watcher *w = watchers[x];
-        if (w == NULL)
+        char *skip_scr = NULL;
+        if (w == NULL || (e->eflags & w->eflags) == 0)
             continue;
 
-        if ((e->eflags & w->eflags) == 0) {
-            L_DEBUG("LOGGER: Skipping event for watcher [%d] (w->eflags: %d) (e->eflags: %d)\n",
-                    w->sfd, w->eflags, e->eflags);
-            continue;
+         /* Avoid poll()'ing constantly when buffer is full by resetting a
+         * flag periodically.
+         */
+        while (!w->failed_flush &&
+                (skip_scr = (char *) bipbuf_request(w->buf, scratch_len + 128)) == NULL) {
+            if (logger_thread_poll_watchers(0, x) <= 0) {
+                L_DEBUG("LOGGER: Watcher had no free space for line of size (%d)\n", line_size);
+                w->failed_flush = true;
+            }
         }
 
         if (w->failed_flush) {
             L_DEBUG("LOGGER: Fast skipped for watcher [%d] due to failed_flush\n", w->sfd);
             w->skipped++;
             ls->watcher_skipped++;
-        } else if (w->skipped > 0) {
-            char *skip_scr = NULL;
-            if ((skip_scr = (char *) bipbuf_request(w->buf, line_size + 128)) != NULL) {
-                total = snprintf(skip_scr, 128, "skipped=%llu\n", (unsigned long long) w->skipped);
-                if (total >= 128 || total <= 0) {
-                    L_DEBUG("LOGGER: Failed to flatten skipped message into watcher [%d]\n", w->sfd);
-                    w->skipped++;
-                    ls->watcher_skipped++;
-                } else {
-                    /* These can't fail because bipbuf_request succeeded. */
-                    bipbuf_push(w->buf, total + 1);
-                    bipbuf_offer(w->buf, (unsigned char *) scratch, line_size);
-                    w->skipped = 0;
-                    ls->watcher_sent++;
-                }
-            } else {
-                L_DEBUG("LOGGER: Continuing to fast skip for watcher [%d]\n", w->sfd);
+            continue;
+        }
+
+        if (w->skipped > 0) {
+            total = snprintf(skip_scr, 128, "skipped=%llu\n", (unsigned long long) w->skipped);
+            if (total >= 128 || total <= 0) {
+                L_DEBUG("LOGGER: Failed to flatten skipped message into watcher [%d]\n", w->sfd);
                 w->skipped++;
                 ls->watcher_skipped++;
-                w->failed_flush = true;
+                continue;
             }
-        } else {
-             /* Avoid poll()'ing constantly when buffer is full by resetting a
-             * flag periodically.
-             */
-            while (bipbuf_offer(w->buf, (unsigned char *) scratch, line_size) == 0) {
-                if (logger_thread_poll_watchers(0, x) <= 0) {
-                    L_DEBUG("LOGGER: Watcher had no free space for line of size (%d)\n", line_size);
-                    w->failed_flush = true;
-                    w->skipped++;
-                    ls->watcher_skipped++;
-                    break;
-                }
-            }
-            if (!w->failed_flush)
-                ls->watcher_sent++;
+            bipbuf_push(w->buf, total + 1);
+            w->skipped = 0;
         }
+        /* Can't fail because bipbuf_request succeeded. */
+        bipbuf_offer(w->buf, (unsigned char *) scratch, scratch_len);
+        ls->watcher_sent++;
     }
-
-    return LOGGER_PARSE_ENTRY_OK;
 }
 
 /* Called with logger stack locked.
@@ -358,6 +290,7 @@ static int logger_thread_read(logger *l, struct logger_stats *ls) {
     unsigned int size;
     unsigned int pos = 0;
     unsigned char *data;
+    char scratch[LOGGER_PARSE_SCRATCH];
     logentry *e;
     pthread_mutex_lock(&l->mutex);
     data = bipbuf_peek_all(l->buf, &size);
@@ -371,11 +304,14 @@ static int logger_thread_read(logger *l, struct logger_stats *ls) {
     /* parse buffer */
     while (pos < size && watcher_count > 0) {
         enum logger_parse_entry_ret ret;
+        int scratch_len = 0;
         e = (logentry *) (data + pos);
-        ret = logger_thread_parse_entry(e, ls);
+        ret = logger_thread_parse_entry(e, ls, scratch, &scratch_len);
         if (ret != LOGGER_PARSE_ENTRY_OK) {
             /* TODO: stats counter */
             fprintf(stderr, "LOGGER: Failed to parse log entry\n");
+        } else {
+            logger_thread_write_entry(e, ls, scratch, scratch_len);
         }
         pos += sizeof(logentry) + e->size;
     }
@@ -581,7 +517,6 @@ void logger_init(void) {
     logger_stack_head = 0;
     logger_stack_tail = 0;
     pthread_key_create(&logger_key, NULL);
-    logger_uriencode_init();
 
     if (start_logger_thread() != 0) {
         abort();

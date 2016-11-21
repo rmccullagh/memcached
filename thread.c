@@ -24,6 +24,7 @@ struct conn_queue_item {
     int               event_flags;
     int               read_buffer_size;
     enum network_transport     transport;
+    conn *c;
     CQ_ITEM          *next;
 };
 
@@ -61,8 +62,6 @@ static uint32_t item_lock_count;
 unsigned int item_lock_hashpower;
 #define hashsize(n) ((unsigned long int)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
-
-static LIBEVENT_DISPATCHER_THREAD dispatcher_thread;
 
 /*
  * Each libevent instance has a wakeup pipe, which other threads
@@ -114,7 +113,7 @@ unsigned short refcount_decr(unsigned short *refcount) {
  * associated hash bucket, or the structure itself.
  * LRU modifications must hold the item lock, and the LRU lock.
  * LRU's accessing items must item_trylock() before modifying an item.
- * Items accessable from an LRU must not be freed or modified
+ * Items accessible from an LRU must not be freed or modified
  * without first locking and removing from the LRU.
  */
 
@@ -424,6 +423,14 @@ static void thread_libevent_process(int fd, short which, void *arg) {
             cqi_free(item);
         }
         break;
+    case 'r':
+        item = cq_pop(me->new_conn_queue);
+
+        if (NULL != item) {
+            conn_worker_readd(item->c);
+            cqi_free(item);
+        }
+        break;
     /* we were told to pause and report in */
     case 'p':
         register_thread_initialized();
@@ -483,30 +490,28 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
 /*
  * Re-dispatches a connection back to the original thread. Can be called from
  * any side thread borrowing a connection.
- * TODO: Look into this. too complicated?
  */
-#ifdef BOGUS_DEFINE
 void redispatch_conn(conn *c) {
     CQ_ITEM *item = cqi_new();
     char buf[1];
     if (item == NULL) {
         /* Can't cleanly redispatch connection. close it forcefully. */
-        /* FIXME: is conn_cleanup() necessary?
-         * if conn was handed off to a side thread it should be clean.
-         * could also put it into a "clean_me" state?
-         */
         c->state = conn_closed;
         close(c->sfd);
         return;
     }
     LIBEVENT_THREAD *thread = c->thread;
-    item->sfd = sfd;
-    /* pass in the state somehow?
-    item->init_state = conn_closing; */
-    item->event_flags = c->event_flags;
-    item->conn = c;
+    item->sfd = c->sfd;
+    item->init_state = conn_new_cmd;
+    item->c = c;
+
+    cq_push(thread->new_conn_queue, item);
+
+    buf[0] = 'r';
+    if (write(thread->notify_send_fd, buf, 1) != 1) {
+        perror("Writing to thread notify pipe");
+    }
 }
-#endif
 
 /* This misses the allow_new_conns flag :( */
 void sidethread_conn_close(conn *c) {
@@ -516,17 +521,10 @@ void sidethread_conn_close(conn *c) {
     close(c->sfd);
 
     STATS_LOCK();
-    stats.curr_conns--;
+    stats_state.curr_conns--;
     STATS_UNLOCK();
 
     return;
-}
-
-/*
- * Returns true if this is the thread that listens for new TCP connections.
- */
-int is_listen_thread() {
-    return pthread_self() == dispatcher_thread.thread_id;
 }
 
 /********************************* ITEM ACCESS *******************************/
@@ -537,7 +535,7 @@ int is_listen_thread() {
 item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes) {
     item *it;
     /* do_item_alloc handles its own locks */
-    it = do_item_alloc(key, nkey, flags, exptime, nbytes, 0);
+    it = do_item_alloc(key, nkey, flags, exptime, nbytes);
     return it;
 }
 
@@ -666,37 +664,15 @@ void STATS_UNLOCK() {
 }
 
 void threadlocal_stats_reset(void) {
-    int ii, sid;
+    int ii;
     for (ii = 0; ii < settings.num_threads; ++ii) {
         pthread_mutex_lock(&threads[ii].stats.mutex);
+#define X(name) threads[ii].stats.name = 0;
+        THREAD_STATS_FIELDS
+#undef X
 
-        threads[ii].stats.get_cmds = 0;
-        threads[ii].stats.get_misses = 0;
-        threads[ii].stats.get_expired = 0;
-        threads[ii].stats.touch_cmds = 0;
-        threads[ii].stats.touch_misses = 0;
-        threads[ii].stats.delete_misses = 0;
-        threads[ii].stats.incr_misses = 0;
-        threads[ii].stats.decr_misses = 0;
-        threads[ii].stats.cas_misses = 0;
-        threads[ii].stats.bytes_read = 0;
-        threads[ii].stats.bytes_written = 0;
-        threads[ii].stats.flush_cmds = 0;
-        threads[ii].stats.conn_yields = 0;
-        threads[ii].stats.auth_cmds = 0;
-        threads[ii].stats.auth_errors = 0;
-        threads[ii].stats.idle_kicks = 0;
-
-        for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
-            threads[ii].stats.slab_stats[sid].set_cmds = 0;
-            threads[ii].stats.slab_stats[sid].get_hits = 0;
-            threads[ii].stats.slab_stats[sid].touch_hits = 0;
-            threads[ii].stats.slab_stats[sid].delete_hits = 0;
-            threads[ii].stats.slab_stats[sid].incr_hits = 0;
-            threads[ii].stats.slab_stats[sid].decr_hits = 0;
-            threads[ii].stats.slab_stats[sid].cas_hits = 0;
-            threads[ii].stats.slab_stats[sid].cas_badval = 0;
-        }
+        memset(&threads[ii].stats.slab_stats, 0,
+                sizeof(threads[ii].stats.slab_stats));
 
         pthread_mutex_unlock(&threads[ii].stats.mutex);
     }
@@ -711,41 +687,15 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
 
     for (ii = 0; ii < settings.num_threads; ++ii) {
         pthread_mutex_lock(&threads[ii].stats.mutex);
-
-        stats->get_cmds += threads[ii].stats.get_cmds;
-        stats->get_misses += threads[ii].stats.get_misses;
-        stats->get_expired += threads[ii].stats.get_expired;
-        stats->touch_cmds += threads[ii].stats.touch_cmds;
-        stats->touch_misses += threads[ii].stats.touch_misses;
-        stats->delete_misses += threads[ii].stats.delete_misses;
-        stats->decr_misses += threads[ii].stats.decr_misses;
-        stats->incr_misses += threads[ii].stats.incr_misses;
-        stats->cas_misses += threads[ii].stats.cas_misses;
-        stats->bytes_read += threads[ii].stats.bytes_read;
-        stats->bytes_written += threads[ii].stats.bytes_written;
-        stats->flush_cmds += threads[ii].stats.flush_cmds;
-        stats->conn_yields += threads[ii].stats.conn_yields;
-        stats->auth_cmds += threads[ii].stats.auth_cmds;
-        stats->auth_errors += threads[ii].stats.auth_errors;
-        stats->idle_kicks += threads[ii].stats.idle_kicks;
+#define X(name) stats->name += threads[ii].stats.name;
+        THREAD_STATS_FIELDS
+#undef X
 
         for (sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
-            stats->slab_stats[sid].set_cmds +=
-                threads[ii].stats.slab_stats[sid].set_cmds;
-            stats->slab_stats[sid].get_hits +=
-                threads[ii].stats.slab_stats[sid].get_hits;
-            stats->slab_stats[sid].touch_hits +=
-                threads[ii].stats.slab_stats[sid].touch_hits;
-            stats->slab_stats[sid].delete_hits +=
-                threads[ii].stats.slab_stats[sid].delete_hits;
-            stats->slab_stats[sid].decr_hits +=
-                threads[ii].stats.slab_stats[sid].decr_hits;
-            stats->slab_stats[sid].incr_hits +=
-                threads[ii].stats.slab_stats[sid].incr_hits;
-            stats->slab_stats[sid].cas_hits +=
-                threads[ii].stats.slab_stats[sid].cas_hits;
-            stats->slab_stats[sid].cas_badval +=
-                threads[ii].stats.slab_stats[sid].cas_badval;
+#define X(name) stats->slab_stats[sid].name += \
+            threads[ii].stats.slab_stats[sid].name;
+            SLAB_STATS_FIELDS
+#undef X
         }
 
         pthread_mutex_unlock(&threads[ii].stats.mutex);
@@ -755,24 +705,12 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
 void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
     int sid;
 
-    out->set_cmds = 0;
-    out->get_hits = 0;
-    out->touch_hits = 0;
-    out->delete_hits = 0;
-    out->incr_hits = 0;
-    out->decr_hits = 0;
-    out->cas_hits = 0;
-    out->cas_badval = 0;
+    memset(out, 0, sizeof(*out));
 
     for (sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
-        out->set_cmds += stats->slab_stats[sid].set_cmds;
-        out->get_hits += stats->slab_stats[sid].get_hits;
-        out->touch_hits += stats->slab_stats[sid].touch_hits;
-        out->delete_hits += stats->slab_stats[sid].delete_hits;
-        out->decr_hits += stats->slab_stats[sid].decr_hits;
-        out->incr_hits += stats->slab_stats[sid].incr_hits;
-        out->cas_hits += stats->slab_stats[sid].cas_hits;
-        out->cas_badval += stats->slab_stats[sid].cas_badval;
+#define X(name) out->name += stats->slab_stats[sid].name;
+        SLAB_STATS_FIELDS
+#undef X
     }
 }
 
@@ -780,9 +718,8 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
  * Initializes the thread subsystem, creating various worker threads.
  *
  * nthreads  Number of worker event handler threads to spawn
- * main_base Event base for main thread
  */
-void memcached_thread_init(int nthreads, struct event_base *main_base) {
+void memcached_thread_init(int nthreads) {
     int         i;
     int         power;
 
@@ -834,9 +771,6 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
         exit(1);
     }
 
-    dispatcher_thread.base = main_base;
-    dispatcher_thread.thread_id = pthread_self();
-
     for (i = 0; i < nthreads; i++) {
         int fds[2];
         if (pipe(fds)) {
@@ -849,7 +783,7 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
 
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
-        stats.reserved_fds += 5;
+        stats_state.reserved_fds += 5;
     }
 
     /* Create threads after we've done all the libevent setup. */

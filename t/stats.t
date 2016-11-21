@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 
 use strict;
-use Test::More tests => 103;
+use Test::More tests => 108;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
@@ -17,54 +17,6 @@ my $sock = $server->sock;
 ## STAT time 1259170891
 ## STAT version 1.4.3
 ## STAT libevent 1.4.13-stable.
-## STAT pointer_size 32
-## STAT rusage_user 0.001198
-## STAT rusage_system 0.003523
-## STAT curr_connections 10
-## STAT total_connections 11
-## STAT connection_structures 11
-## STAT reserved_fds 20
-## STAT cmd_get 0
-## STAT cmd_set 0
-## STAT cmd_flush 0
-## STAT cmd_touch 0
-## STAT get_hits 0
-## STAT get_misses 0
-## STAT get_expired 0
-## STAT delete_misses 0
-## STAT delete_hits 0
-## STAT incr_misses 0
-## STAT incr_hits 0
-## STAT decr_misses 0
-## STAT decr_hits 0
-## STAT cas_misses 0
-## STAT cas_hits 0
-## STAT cas_badval 0
-## STAT touch_hits 0
-## STAT touch_misses 0
-## STAT auth_cmds 0
-## STAT auth_unknowns 0
-## STAT bytes_read 7
-## STAT bytes_written 0
-## STAT limit_maxbytes 67108864
-## STAT accepting_conns 1
-## STAT listen_disabled_num 0
-## STAT time_in_listen_disabled_us 0
-## STAT threads 4
-## STAT conn_yields 0
-## STAT hash_power_level 16
-## STAT hash_bytes 524288
-## STAT hash_is_expanding 0
-## STAT malloc_fails 0
-## STAT bytes 0
-## STAT curr_items 0
-## STAT total_items 0
-## STAT expired_unfetched 0
-## STAT evicted_unfetched 0
-## STAT evictions 0
-## STAT reclaimed 0
-## STAT crawler_reclaimed 0
-## STAT lrutail_reflocked 0
 ## see doc/protocol.txt for others
 # note that auth stats are tested in auth specfic tests
 
@@ -72,11 +24,11 @@ my $sock = $server->sock;
 my $stats = mem_stats($sock);
 
 # Test number of keys
-is(scalar(keys(%$stats)), 58, "58 stats values");
+is(scalar(keys(%$stats)), 59, "59 stats values");
 
 # Test initial state
 foreach my $key (qw(curr_items total_items bytes cmd_get cmd_set get_hits evictions get_misses get_expired
-                 bytes_written delete_hits delete_misses incr_hits incr_misses decr_hits
+                 bytes_written delete_hits delete_misses incr_hits incr_misses decr_hits get_flushed
                  decr_misses listen_disabled_num lrutail_reflocked time_in_listen_disabled_us)) {
     is($stats->{$key}, 0, "initial $key is zero");
 }
@@ -192,6 +144,7 @@ is(0, $stats->{'cmd_set'});
 is(0, $stats->{'get_hits'});
 is(0, $stats->{'get_misses'});
 is(0, $stats->{'get_expired'});
+is(0, $stats->{'get_flushed'});
 is(0, $stats->{'delete_misses'});
 is(0, $stats->{'delete_hits'});
 is(0, $stats->{'incr_misses'});
@@ -213,8 +166,13 @@ is(scalar <$sock>, "END\r\n", "item not returned");
 my $stats = mem_stats($sock);
 is(1, $stats->{'get_expired'}, "get_expired counter is 1");
 
+print $sock "set should_be_flushed 0 0 6\r\nbooval\r\n";
+is(scalar <$sock>, "STORED\r\n", "set item to flush");
 print $sock "flush_all\r\n";
 is(scalar <$sock>, "OK\r\n", "flushed");
+print $sock "get should_be_flushed\r\n";
+is(scalar <$sock>, "END\r\n", "flushed item not returned");
 
 my $stats = mem_stats($sock);
 is($stats->{cmd_flush}, 1, "after one flush cmd_flush is 1");
+is($stats->{get_flushed}, 1, "after flush and a get, get_flushed is 1");

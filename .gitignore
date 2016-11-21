@@ -1,9 +1,10 @@
-*.[ao]
+*.[aois]
 *.gcov
 *.gcda
 *.gcno
 *.tcov
 .deps
+.buildbot
 INSTALL
 Makefile
 Makefile.in
@@ -30,6 +31,7 @@ cscope.out
 memcached_dtrace.h
 *~
 memcached-*.tar.gz
+memcached-*.tar.gz.sha1
 doc/protocol-binary-range.txt
 doc/protocol-binary.txt
 /sizes

@@ -468,6 +468,29 @@ The response line could be one of:
 
 - "BADCLASS [message]" to indicate an invalid class was specified.
 
+lru_crawler metadump <classid,classid,classid|all>
+
+- Similar in function to the above "lru_crawler crawl" command, this function
+  outputs one line for every valid item found in the matching slab classes.
+  Similar to "cachedump", but does not lock the cache and can return all
+  items, not just 1MB worth.
+
+  Lines are in "key=value key2=value2" format, with value being URI encoded
+  (ie: %20 for a space).
+
+  The exact keys available are subject to change, but will include at least:
+
+  "key", "exp" (expiration time), "la", (last access time), "cas",
+  "fetch" (if item has been fetched before).
+
+The response line could be one of:
+
+- "OK" to indicate successful launch.
+
+- "BUSY [message]" to indicate the crawler is already processing a request.
+
+- "BADCLASS [message]" to indicate an invalid class was specified.
+
 Watchers
 --------
 
@@ -586,6 +609,8 @@ integers separated by a colon (treat this as a floating point number).
 |                       |         | and not found                             |
 | get_expired           | 64u     | Number of items that have been requested  |
 |                       |         | but had already expired.                  |
+| get_flushed           | 64u     | Number of items that have been requested  |
+|                       |         | but have been flushed via flush_all       |
 | delete_misses         | 64u     | Number of deletions reqs for missing keys |
 | delete_hits           | 64u     | Number of deletion reqs resulting in      |
 |                       |         | an item being removed.                    |
@@ -654,6 +679,9 @@ integers separated by a colon (treat this as a floating point number).
 | slab_reassign_evictions_nomem                                               |
 |                       | 64u     | Valid items evicted during a page move    |
 |                       |         | (due to no free memory in slab)           |
+| slab_reassign_chunk_rescues                                                 |
+|                       | 64u     | Individual sections of an item rescued    |
+|                       |         | during a page move.                       |
 | slab_reassign_inline_reclaim                                                |
 |                       | 64u     | Internal stat counter for when the page   |
 |                       |         | mover clears memory from the chunk        |
@@ -707,6 +735,7 @@ other stats command.
 | hashpower_init    | 32       | Starting size multiplier for hash table      |
 | slab_reassign     | bool     | Whether slab page reassignment is allowed    |
 | slab_automove     | bool     | Whether slab page automover is enabled       |
+| slab_chunk_max    | 32       | Max slab class size (avoid unless necessary) |
 | hash_algorithm    | char     | Hash table algorithm in use                  |
 | lru_crawler       | bool     | Whether the LRU crawler is enabled           |
 | lru_crawler_sleep | 32       | Microseconds to sleep between LRU crawls     |
